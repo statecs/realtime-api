@@ -30,23 +30,60 @@ interface SpeechToSpeechRequest {
   assistantId: string;
 }
 
+interface InputTextContentType {
+  type: 'input_text';
+  text: string;
+}
+
+interface InputAudioContentType {
+  type: 'input_audio';
+  audio: string;
+  audio_format?: {
+    sample_rate: number;
+    channel_count: number;
+    bits_per_sample: number;
+  };
+}
+
+function sendUserMessageContent(
+  realtimeClient: RealtimeClient,
+  content: Array<InputTextContentType | InputAudioContentType> = []
+) {
+  if (content.length) {
+    (realtimeClient as any).realtime.send('conversation.item.create', {
+      item: {
+        type: 'message',
+        role: 'user',
+        content,
+      },
+    });
+  }
+
+  realtimeClient.createResponse();
+  return true;
+}
+
+
+
 app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>, res: Response) => {
   const { audio, threadId, assistantId } = req.body;
   console.log("Request received:", { threadId, assistantId, audioLength: audio?.length });
+  console.log("Audio input:", audio);
 
   if (!audio || !threadId || !assistantId) {
     return res.status(400).json({ error: "Audio, thread ID, and assistant ID are required" });
   }
 
+  if (audio.length < 100) {  // Arbitrary threshold for a very short audio input
+    console.warn("Warning: Audio input is suspiciously short. It may not be properly encoded.");
+  }
+
   const realtimeClient = new RealtimeClient({ apiKey: API_TOKENS.OPENAI });
-  let responseStarted = false;
-  let eventReceived = false;
-  let audioChunksReceived = 0;
 
   try {
     console.log("Updating session parameters...");
     realtimeClient.updateSession({
-      instructions: 'You are a helpful assistant.',
+      instructions: 'You are processing audio content. You will transcribe the audio or respond based on its content without identifying speakers.',
       voice: 'alloy',
       turn_detection: { type: 'server_vad' },
       input_audio_transcription: { model: 'whisper-1' },
@@ -56,46 +93,72 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
     await realtimeClient.connect();
     console.log("Connected to Realtime API");
 
-    realtimeClient.on('realtime.event', (event: any) => {
-      console.log("Realtime event received:", JSON.stringify(event, null, 2));
-      eventReceived = true;
-    });
+    // Attempt to decode the base64 string
+    let audioBuffer: Buffer;
+    try {
+      audioBuffer = Buffer.from(audio, 'base64');
+      console.log("Decoded audio buffer length:", audioBuffer.byteLength);
+    } catch (decodeError) {
+      console.error("Failed to decode base64 audio:", decodeError);
+      return res.status(400).json({ error: "Invalid audio encoding" });
+    }
+
+    if (audioBuffer.byteLength === 0) {
+      console.error("Decoded audio buffer is empty");
+      return res.status(400).json({ error: "Empty audio content" });
+    }
+
+    console.log("Sending audio to Realtime API...");
+    
+    sendUserMessageContent(realtimeClient, [{
+      type: 'input_text',
+      text: 'my name is christopher',  // Send the original base64 audio
+    }]);
+
+    sendUserMessageContent(realtimeClient, [{
+      type: 'input_audio',
+      audio: audio,  // Send the original base64 audio
+      audio_format: {
+        sample_rate: 16000,
+        channel_count: 1,
+        bits_per_sample: 16
+      }
+    }]);
+
+    let transcriptionReceived = false;
 
     realtimeClient.on('conversation.updated', (event: any) => {
-      console.log("Conversation updated:", JSON.stringify(event, null, 2));
-      const { item, delta } = event;
-      if (item.role === 'assistant' && item.status === 'completed') {
-        console.log("Assistant response completed:", item.formatted.transcript);
-        if (item.formatted.audio && item.formatted.audio.length > 0) {
-          console.log("Sending formatted audio to client, length:", item.formatted.audio.length);
-          sendAudioToClient(res, item.formatted.audio);
-        } else {
-          console.log("No formatted audio received in conversation.updated event");
+      console.log("Conversation updated:", event.item);
+      if (event.item.role === 'assistant') {
+        const { transcript, audio } = event.item.formatted;
+        if (transcript && !transcriptionReceived) {
+          console.log("Transcription of input audio:", transcript);
+          transcriptionReceived = true;
+        }
+        if (event.item.status === 'completed' && audio) {
+          sendAudioToClient(res, audio);
         }
       }
     });
 
-    realtimeClient.on('speech.in_progress', (event: { delta: { audio: Int16Array } }) => {
-      console.log("Received speech chunk, length:", event.delta.audio.length);
-      audioChunksReceived++;
-      sendAudioToClient(res, event.delta.audio);
-    });
-
-    realtimeClient.on('speech.completed', () => {
-      console.log("Speech completed, total audio chunks received:", audioChunksReceived);
+    realtimeClient.on('error', (error: any) => {
+      console.error("Realtime API error:", error);
       if (!res.writableEnded) {
-        res.end();
+        res.status(500).json({ error: "Error processing audio" });
       }
     });
 
-    const audioBuffer = Buffer.from(audio, 'base64');
-    console.log("Appending audio input, length:", audioBuffer.length);
-    realtimeClient.appendInputAudio(new Int16Array(audioBuffer.buffer));
-    console.log("Audio input appended");
+    // Wait for the response to complete or timeout
+    await Promise.race([
+      new Promise((resolve) => realtimeClient.on('speech.completed', resolve)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 30000))
+    ]);
 
-    console.log("Creating response...");
-    realtimeClient.createResponse();
-    console.log("Response creation initiated");
+    console.log("Speech-to-speech process completed");
+
+    if (!transcriptionReceived) {
+      console.warn("Warning: No transcription was received from the Realtime API");
+    }
 
     req.on('close', () => {
       console.log("Client disconnected");
@@ -106,15 +169,10 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
     console.error('Error in speech-to-speech:', error);
     realtimeClient.disconnect();
     if (!res.writableEnded) {
-      if (!responseStarted) {
-        res.status(500).json({ error: "Failed to process speech-to-speech request" });
-      } else {
-        res.end();
-      }
+      res.status(500).json({ error: "Failed to process speech-to-speech request" });
     }
   }
 });
-
 
 function sendAudioToClient(res: Response, audio: Int16Array) {
   if (!res.writableEnded) {
