@@ -49,33 +49,51 @@ function sendUserMessageContent(
   realtimeClient: RealtimeClient,
   content: Array<InputTextContentType | InputAudioContentType> = []
 ) {
+  console.log("Sending user message content to Realtime API");
+  console.log("Content length:", content.length);
+  
   if (content.length) {
-    (realtimeClient as any).realtime.send('conversation.item.create', {
-      item: {
-        type: 'message',
-        role: 'user',
-        content,
-      },
-    });
+    const audioContent = content.find(item => item.type === 'input_audio') as InputAudioContentType | undefined;
+    if (audioContent) {
+      console.log("Audio content found:");
+      console.log("- Audio length:", audioContent.audio.length);
+      console.log("- Audio format:", JSON.stringify(audioContent.audio_format));
+
+    }
+
+    try {
+      (realtimeClient as any).realtime.send('conversation.item.create', {
+        item: {
+          type: 'message',
+          role: 'user',
+          content,
+        },
+      });
+      console.log("Message sent successfully to Realtime API", content);
+    } catch (error) {
+      console.error("Error sending message to Realtime API:", error);
+      throw error;
+    }
+  } else {
+    console.warn("No content to send to Realtime API");
   }
 
   realtimeClient.createResponse();
   return true;
 }
 
-
-
 app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>, res: Response) => {
   const { audio, threadId, assistantId } = req.body;
   console.log("Request received:", { threadId, assistantId, audioLength: audio?.length });
-  console.log("Audio input:", audio);
 
   if (!audio || !threadId || !assistantId) {
+    console.error("Missing required parameters");
     return res.status(400).json({ error: "Audio, thread ID, and assistant ID are required" });
   }
 
-  if (audio.length < 100) {  // Arbitrary threshold for a very short audio input
-    console.warn("Warning: Audio input is suspiciously short. It may not be properly encoded.");
+  if (!API_TOKENS.OPENAI) {
+    console.error("OpenAI API key is missing");
+    return res.status(500).json({ error: "Server configuration error" });
   }
 
   const realtimeClient = new RealtimeClient({ apiKey: API_TOKENS.OPENAI });
@@ -83,7 +101,7 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
   try {
     console.log("Updating session parameters...");
     realtimeClient.updateSession({
-      instructions: 'You are processing audio content. You will transcribe the audio or respond based on its content without identifying speakers.',
+      instructions: 'You are processing audio content',
       voice: 'alloy',
       turn_detection: { type: 'server_vad' },
       input_audio_transcription: { model: 'whisper-1' },
@@ -93,42 +111,32 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
     await realtimeClient.connect();
     console.log("Connected to Realtime API");
 
-    // Attempt to decode the base64 string
-    let audioBuffer: Buffer;
-    try {
-      audioBuffer = Buffer.from(audio, 'base64');
-      console.log("Decoded audio buffer length:", audioBuffer.byteLength);
-    } catch (decodeError) {
-      console.error("Failed to decode base64 audio:", decodeError);
-      return res.status(400).json({ error: "Invalid audio encoding" });
-    }
 
-    if (audioBuffer.byteLength === 0) {
-      console.error("Decoded audio buffer is empty");
+    if (audio.length === 0) {
+      console.error("Received audio is empty");
       return res.status(400).json({ error: "Empty audio content" });
     }
 
     console.log("Sending audio to Realtime API...");
-    
-    sendUserMessageContent(realtimeClient, [{
-      type: 'input_text',
-      text: 'my name is christopher',  // Send the original base64 audio
-    }]);
 
-    sendUserMessageContent(realtimeClient, [{
-      type: 'input_audio',
-      audio: audio,  // Send the original base64 audio
-      audio_format: {
-        sample_rate: 16000,
-        channel_count: 1,
-        bits_per_sample: 16
-      }
-    }]);
+    const decodedText = Buffer.from(audio, 'base64').toString('utf-8');
+    
+    try {
+
+      sendUserMessageContent(realtimeClient, [{
+        type: 'input_text',
+        text: decodedText  // Send the original base64 audio
+      }]);
+
+
+    } catch (error) {
+      console.error("Error in sendUserMessageContent:", error);
+      return res.status(500).json({ error: "Failed to send audio to Realtime API" });
+    }
 
     let transcriptionReceived = false;
 
     realtimeClient.on('conversation.updated', (event: any) => {
-      console.log("Conversation updated:", event.item);
       if (event.item.role === 'assistant') {
         const { transcript, audio } = event.item.formatted;
         if (transcript && !transcriptionReceived) {
@@ -136,6 +144,7 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
           transcriptionReceived = true;
         }
         if (event.item.status === 'completed' && audio) {
+          console.log("Received completed audio response");
           sendAudioToClient(res, audio);
         }
       }
@@ -149,12 +158,18 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
     });
 
     // Wait for the response to complete or timeout
-    await Promise.race([
-      new Promise((resolve) => realtimeClient.on('speech.completed', resolve)),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 30000))
-    ]);
-
-    console.log("Speech-to-speech process completed");
+    try {
+      await Promise.race([
+        new Promise((resolve) => realtimeClient.on('speech.completed', resolve)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 30000))
+      ]);
+      console.log("Speech-to-speech process completed");
+    } catch (error) {
+      console.error("Error or timeout in speech-to-speech process:", error);
+      if (!res.writableEnded) {
+        res.status(500).json({ error: "Speech-to-speech process failed or timed out" });
+      }
+    }
 
     if (!transcriptionReceived) {
       console.warn("Warning: No transcription was received from the Realtime API");
@@ -179,15 +194,15 @@ function sendAudioToClient(res: Response, audio: Int16Array) {
     if (!res.headersSent) {
       console.log("Sending headers to client");
       res.writeHead(200, {
-        'Content-Type': 'audio/wav', // Change to audio/wav
+        'Content-Type': 'audio/wav',
         'Transfer-Encoding': 'chunked'
       });
     }
 
     // Create a WAV file from the PCM data
     const wavData = {
-      sampleRate: 16000, // Use the correct sample rate of your audio
-      channelData: [audio] // mono or stereo, adjust accordingly
+      sampleRate: 16000,
+      channelData: [audio]
     };
 
     const float32ChannelData = wavData.channelData.map(channel => 
@@ -199,7 +214,7 @@ function sendAudioToClient(res: Response, audio: Int16Array) {
       channelData: float32ChannelData
     }).then((buffer: ArrayBuffer) => {
       console.log("Sending encoded WAV audio to client, length:", buffer.byteLength);
-      res.write(Buffer.from(buffer)); // Send the encoded WAV audio to the client
+      res.write(Buffer.from(buffer));
       res.end();
     }).catch((error: Error) => {
       console.error("Error encoding WAV audio:", error);
