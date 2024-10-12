@@ -1,34 +1,13 @@
-// src/server.ts
-import express, { Request, Response, NextFunction } from 'express';
-import fetch from 'node-fetch';
+import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import { RealtimeClient } from '@openai/realtime-api-beta';
-import { Readable } from 'stream';
 
 dotenv.config();
-
-// Define types for events
-interface ConversationEvent {
-  item: {
-    role: string;
-  };
-  delta?: {
-    content?: string;
-  };
-}
-
-interface SpeechEvent {
-  delta: {
-    audio: Buffer;
-  };
-}
-
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Your API tokens stored securely on the server
 interface ApiTokens {
   OPENAI: string;
   ANTHROPIC: string;
@@ -42,88 +21,118 @@ const API_TOKENS: ApiTokens = {
 };
 
 app.use(express.json());
-
-// Enable CORS for all routes
 app.use(cors());
 
-// New route for speech-to-speech using Realtime API
-app.post("/speech-to-speech", async (req: Request, res: Response) => {
+interface SpeechToSpeechRequest {
+  audio: string;
+  threadId: string;
+  assistantId: string;
+}
+
+app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>, res: Response) => {
+  const { audio, threadId, assistantId } = req.body;
+  console.log("Request received:", { threadId, assistantId, audioLength: audio?.length });
+
+  if (!audio || !threadId || !assistantId) {
+    return res.status(400).json({ error: "Audio, thread ID, and assistant ID are required" });
+  }
+
+  const realtimeClient = new RealtimeClient({ apiKey: API_TOKENS.OPENAI });
+  let responseStarted = false;
+  let eventReceived = false;
+  let audioChunksReceived = 0;
+
   try {
-    const { audio, threadId, assistantId } = req.body;
-    console.log("Request body:", { threadId, assistantId, audioLength: audio?.length });
-
-
-    if (!audio || !threadId || !assistantId) {
-      return res.status(400).json({ error: "Audio, thread ID, and assistant ID are required" });
-    }
-
-    const realtimeClient = new RealtimeClient({ apiKey: API_TOKENS.OPENAI });
-    console.log(realtimeClient);
-
-    // Set up session parameters
+    console.log("Updating session parameters...");
     realtimeClient.updateSession({
       instructions: 'You are a helpful assistant.',
       voice: 'alloy',
       turn_detection: { type: 'server_vad' },
-      input_audio_transcription: { model: 'whisper-1' }
+      input_audio_transcription: { model: 'whisper-1' },
     });
 
-    // Connect to Realtime API
+    console.log("Connecting to Realtime API...");
     await realtimeClient.connect();
+    console.log("Connected to Realtime API");
 
-    // Convert base64 audio to ArrayBuffer
-    const audioBuffer = Buffer.from(audio, 'base64');
-
-    // Send audio to Realtime API
-    realtimeClient.appendInputAudio(new Int16Array(audioBuffer.buffer));
-    realtimeClient.createResponse();
-
-    // Set up a readable stream to send the response
-    const stream = new Readable({
-      read() {}
+    realtimeClient.on('realtime.event', (event: any) => {
+      console.log("Realtime event received:", JSON.stringify(event, null, 2));
+      eventReceived = true;
     });
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
-
-    realtimeClient.on('conversation.updated', (event: ConversationEvent) => {
+    realtimeClient.on('conversation.updated', (event: any) => {
+      console.log("Conversation updated:", JSON.stringify(event, null, 2));
       const { item, delta } = event;
-      if (item.role === 'assistant' && delta?.content) {
-        stream.push(delta.content);
+      if (item.role === 'assistant' && item.status === 'completed') {
+        console.log("Assistant response completed:", item.formatted.transcript);
+        if (item.formatted.audio && item.formatted.audio.length > 0) {
+          console.log("Sending formatted audio to client, length:", item.formatted.audio.length);
+          sendAudioToClient(res, item.formatted.audio);
+        } else {
+          console.log("No formatted audio received in conversation.updated event");
+        }
       }
     });
 
-    realtimeClient.on('speech.in_progress', (event: SpeechEvent) => {
-      stream.push(event.delta.audio);
+    realtimeClient.on('speech.in_progress', (event: { delta: { audio: Int16Array } }) => {
+      console.log("Received speech chunk, length:", event.delta.audio.length);
+      audioChunksReceived++;
+      sendAudioToClient(res, event.delta.audio);
     });
 
     realtimeClient.on('speech.completed', () => {
-      stream.push(null);
+      console.log("Speech completed, total audio chunks received:", audioChunksReceived);
+      if (!res.writableEnded) {
+        res.end();
+      }
     });
 
-    realtimeClient.on('error', (error: Error) => {
-      console.error('Realtime API error:', error);
-      stream.destroy(error);
-    });
+    const audioBuffer = Buffer.from(audio, 'base64');
+    console.log("Appending audio input, length:", audioBuffer.length);
+    realtimeClient.appendInputAudio(new Int16Array(audioBuffer.buffer));
+    console.log("Audio input appended");
 
-    // Pipe the stream to the response
-    stream.pipe(res);
+    console.log("Creating response...");
+    realtimeClient.createResponse();
+    console.log("Response creation initiated");
 
-    // Handle client disconnect
     req.on('close', () => {
+      console.log("Client disconnected");
       realtimeClient.disconnect();
-      stream.destroy();
     });
 
   } catch (error) {
     console.error('Error in speech-to-speech:', error);
-    res.status(500).json({ error: "Failed to process speech-to-speech request" });
+    realtimeClient.disconnect();
+    if (!res.writableEnded) {
+      if (!responseStarted) {
+        res.status(500).json({ error: "Failed to process speech-to-speech request" });
+      } else {
+        res.end();
+      }
+    }
   }
 });
 
+function sendAudioToClient(res: Response, audio: Int16Array) {
+  if (!res.writableEnded) {
+    if (!res.headersSent) {
+      console.log("Sending headers to client");
+      res.writeHead(200, {
+        'Content-Type': 'audio/mpeg',
+        'Transfer-Encoding': 'chunked'
+      });
+    }
+    const audioBuffer = Buffer.from(audio.buffer);
+    console.log("Sending audio chunk to client, length:", audioBuffer.length);
+    res.write(audioBuffer);
+  } else {
+    console.log("Cannot send audio: Response has already ended");
+  }
+}
 
 app.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
 });
 
-export {};  // Add this line at the end of the file
+export {};
