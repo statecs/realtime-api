@@ -1,12 +1,19 @@
-require('dotenv').config({ path: '.env' });
-const fs = require('fs').promises;
-const path = require('path');
-const { NodeSSH } = require('node-ssh');
-const SftpClient = require('ssh2-sftp-client');
+import dotenv from 'dotenv';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { NodeSSH } from 'node-ssh';
+import SftpClient from 'ssh2-sftp-client';
+import { fileURLToPath } from 'url';
+
+dotenv.config({ path: '.env' });
+
 const sftp = new SftpClient();
 const ssh = new NodeSSH();
 
-const localDir = process.cwd();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const localDir = __dirname;
 const remoteDir = '/var/www/api2.cstate.se';
 const exclude = ['node_modules', '.git'];
 
@@ -61,7 +68,7 @@ async function uploadAndExecuteCommands() {
       password: process.env.SFTP_PASSWORD,
     });
 
-    result = await ssh.execCommand('npm install', { cwd: remoteDir });
+    let result = await ssh.execCommand('npm install', { cwd: remoteDir });
     if (result.stdout) console.log('Install stdout:', result.stdout);
     if (result.stderr) console.error('Install stderr:', result.stderr);
 
@@ -70,14 +77,13 @@ async function uploadAndExecuteCommands() {
     if (result.stderr) console.error('Build stderr:', result.stderr);
 
     // Use PM2 with the ecosystem file
-    result = await ssh.execCommand('pm2 delete ecosystem.config.js || true', { cwd: remoteDir });
+    result = await ssh.execCommand('pm2 delete ecosystem.config.cjs || true', { cwd: remoteDir });
     if (result.stdout) console.log('PM2 delete stdout:', result.stdout);
     if (result.stderr) console.error('PM2 delete stderr:', result.stderr);
 
-    result = await ssh.execCommand('pm2 start ecosystem.config.js', { cwd: remoteDir });
+    result = await ssh.execCommand('pm2 start ecosystem.config.cjs', { cwd: remoteDir });
     if (result.stdout) console.log('PM2 start stdout:', result.stdout);
     if (result.stderr) console.error('PM2 start stderr:', result.stderr);
-    
 
   } catch (err) {
     console.error('Error during the process:', err);
