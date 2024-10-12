@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import { RealtimeClient } from '@openai/realtime-api-beta';
+import WavEncoder from 'wav-encoder';
 
 dotenv.config();
 
@@ -114,18 +115,38 @@ app.post("/speech-to-speech", async (req: Request<{}, {}, SpeechToSpeechRequest>
   }
 });
 
+
 function sendAudioToClient(res: Response, audio: Int16Array) {
   if (!res.writableEnded) {
     if (!res.headersSent) {
       console.log("Sending headers to client");
       res.writeHead(200, {
-        'Content-Type': 'audio/mpeg',
+        'Content-Type': 'audio/wav', // Change to audio/wav
         'Transfer-Encoding': 'chunked'
       });
     }
-    const audioBuffer = Buffer.from(audio.buffer);
-    console.log("Sending audio chunk to client, length:", audioBuffer.length);
-    res.write(audioBuffer);
+
+    // Create a WAV file from the PCM data
+    const wavData = {
+      sampleRate: 16000, // Use the correct sample rate of your audio
+      channelData: [audio] // mono or stereo, adjust accordingly
+    };
+
+    const float32ChannelData = wavData.channelData.map(channel => 
+      Float32Array.from(channel, x => x / 32768)
+    );
+
+    WavEncoder.encode({
+      sampleRate: wavData.sampleRate,
+      channelData: float32ChannelData
+    }).then((buffer: ArrayBuffer) => {
+      console.log("Sending encoded WAV audio to client, length:", buffer.byteLength);
+      res.write(Buffer.from(buffer)); // Send the encoded WAV audio to the client
+      res.end();
+    }).catch((error: Error) => {
+      console.error("Error encoding WAV audio:", error);
+      res.status(500).json({ error: "Failed to encode audio" });
+    });
   } else {
     console.log("Cannot send audio: Response has already ended");
   }
