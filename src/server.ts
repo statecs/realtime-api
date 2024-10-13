@@ -59,13 +59,18 @@ wss.on('connection', (ws: WebSocket) => {
         await realtimeClient.connect();
         console.log('Connected to Realtime API');
 
-        // Handle responses from Realtime API
         realtimeClient.on('conversation.updated', (event: any) => {
           console.log('Conversation updated event:', event);
+          if (event.item.role === 'user' && event.item.status === 'completed') {
+            const { transcript } = event.item.formatted;
+            if (transcript) {
+              ws.send(JSON.stringify({ type: 'transcription', text: transcript }));
+            }
+          }
           if (event.item.role === 'assistant' && event.item.status === 'completed') {
             const { transcript, audio } = event.item.formatted;
             if (transcript) {
-              console.log('Transcription:', transcript);
+              ws.send(JSON.stringify({ type: 'assistant_response', text: transcript }));
             }
             if (audio) {
               sendAudioToClient(ws, audio);
