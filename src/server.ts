@@ -44,7 +44,7 @@ wss.on('connection', (ws: WebSocket) => {
       try {
         await realtimeClient.updateSession({
           instructions: 'You are a helpful assistant processing audio content.',
-          voice: 'alloy',
+          voice: 'echo',
           turn_detection: { type: 'server_vad' },
           input_audio_transcription: { model: 'whisper-1' },
           input_audio_config: { sampling_rate: 16000 },
@@ -62,7 +62,7 @@ wss.on('connection', (ws: WebSocket) => {
         // Handle responses from Realtime API
         realtimeClient.on('conversation.updated', (event: any) => {
           console.log('Conversation updated event:', event);
-          if (event.item.role === 'assistant') {
+          if (event.item.role === 'assistant' && event.item.status === 'completed') {
             const { transcript, audio } = event.item.formatted;
             if (transcript) {
               console.log('Transcription:', transcript);
@@ -97,13 +97,11 @@ wss.on('connection', (ws: WebSocket) => {
       // Process the incoming message
       if (Buffer.isBuffer(message)) {
         int16Data = new Int16Array(message.buffer, message.byteOffset, message.byteLength / Int16Array.BYTES_PER_ELEMENT);
-        console.log('Received audio data from client:', int16Data.length, 'samples');
 
         // Ensure the data is in the expected format
         // If necessary, adjust or validate the audio data here
 
         // Append audio data to Realtime API
-        console.log('Appending audio data to Realtime API');
         realtimeClient.appendInputAudio(int16Data);
       } else {
         console.error('Received data is not a Buffer');
@@ -128,28 +126,14 @@ wss.on('connection', (ws: WebSocket) => {
 });
 
 function sendAudioToClient(ws: WebSocket, audio: Int16Array) {
-  // Create a WAV file from the PCM data
-  const wavData = {
-    sampleRate: 16000,
-    channelData: [audio],
-  };
+  // Convert Int16Array to Float32Array
+  const float32Data = new Float32Array(audio.length);
+  for (let i = 0; i < audio.length; i++) {
+    float32Data[i] = audio[i] / 32767; // Normalize to range [-1, 1]
+  }
 
-  const float32ChannelData = wavData.channelData.map((channel) =>
-    Float32Array.from(channel, (x) => x / 32768)
-  );
-
-  WavEncoder.encode({
-    sampleRate: wavData.sampleRate,
-    channelData: float32ChannelData,
-  })
-    .then((buffer: ArrayBuffer) => {
-      console.log('Sending encoded WAV audio to client');
-      ws.send(Buffer.from(buffer));
-    })
-    .catch((error: Error) => {
-      console.error('Error encoding WAV audio:', error);
-      ws.send(JSON.stringify({ error: 'Failed to encode audio' }));
-    });
+  // Send the Float32Array directly
+  ws.send(float32Data.buffer, { binary: true });
 }
 
 server.listen(port, () => {
