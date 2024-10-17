@@ -60,7 +60,6 @@ wss.on('connection', (ws: WebSocket) => {
         console.log('Connected to Realtime API');
 
         realtimeClient.on('conversation.updated', (event: any) => {
-          console.log('Conversation updated event:', event);
           if (event.item.role === 'user' && event.item.status === 'completed') {
             const { transcript } = event.item.formatted;
             if (transcript) {
