@@ -9,6 +9,5 @@
     "typeRoots": ["./node_modules/@types", "./src"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules/@openai/realtime-api-beta/dist/lib/**/*.d.ts"]
+  "include": ["src/**/*"]
 }
