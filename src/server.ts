@@ -91,10 +91,10 @@ wss.on('connection', (ws: WebSocket) => {
         if (event.transcript)
           ws.send(JSON.stringify({ type: 'transcription', text: event.transcript }));
         break;
-      case 'response.audio.delta':
+      case 'response.output_audio.delta':
         if (event.delta) sendAudioToClient(ws, event.delta);
         break;
-      case 'response.audio_transcript.done':
+      case 'response.output_audio_transcript.done':
         if (event.transcript)
           ws.send(JSON.stringify({ type: 'assistant_response', text: event.transcript }));
         break;
